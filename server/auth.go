@@ -1082,6 +1082,8 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			}
 		}
 
+		ihdr := buildJWTTagHeader(juc.Tags)
+
 		// Hold onto the user's public key.
 		c.mu.Lock()
 		c.pubKey = juc.Subject
@@ -1092,6 +1094,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 		c.tags = juc.Tags
 		c.nameTag = juc.Name
+		c.ihdr = ihdr
 		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.

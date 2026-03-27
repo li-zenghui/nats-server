@@ -321,6 +321,7 @@ type client struct {
 
 	tags    jwt.TagList
 	nameTag string
+	ihdr    []byte
 
 	tlsTo *time.Timer
 
@@ -3450,9 +3451,32 @@ func (c *client) checkDenySub(subject string) bool {
 	return false
 }
 
+// Return the pre-compiled JWT tag headers for this producer if available.
+// "full" is a full header block (starts with "NATS/1.0\r\n" and ends with "\r\n"),
+// and "tags" contains only the tag lines (ending with "\r\n" for each line).
+func (c *client) jwtTagHeadersForInject() (full, tags []byte) {
+	if c.kind != CLIENT || len(c.ihdr) == 0 {
+		return nil, nil
+	}
+	end := len(c.ihdr) - LEN_CR_LF
+	if end <= len(hdrLine) {
+		return nil, nil
+	}
+	return c.ihdr, c.ihdr[len(hdrLine):end]
+}
+
+func appendHeaderAndSize(dst []byte, hdrSize, totalSize int) []byte {
+	dst = strconv.AppendInt(dst, int64(hdrSize), 10)
+	dst = append(dst, ' ')
+	return strconv.AppendInt(dst, int64(totalSize), 10)
+}
+
 // Create a message header for routes or leafnodes. Header and origin cluster aware.
 func (c *client) msgHeaderForRouteOrLeaf(subj, reply []byte, rt *routeTarget, acc *Account) []byte {
-	hasHeader := c.pa.hdr > 0
+	ihdr, itags := c.jwtTagHeadersForInject()
+	inject := len(itags) > 0
+	origHasHeader := c.pa.hdr > 0
+	hasHeader := origHasHeader || inject
 	subclient := rt.sub.client
 	canReceiveHeader := subclient.headers
 
@@ -3513,23 +3537,45 @@ func (c *client) msgHeaderForRouteOrLeaf(subj, reply []byte, rt *routeTarget, ac
 
 	if lnoc {
 		// leafnode origin LMSG always have a header entry even if zero.
-		if c.pa.hdr <= 0 {
-			mh = append(mh, '0')
+		if canReceiveHeader && inject {
+			if origHasHeader {
+				delta := len(itags)
+				mh = appendHeaderAndSize(mh, c.pa.hdr+delta, c.pa.size+delta)
+			} else {
+				hsz := len(ihdr)
+				mh = appendHeaderAndSize(mh, hsz, c.pa.size+hsz)
+			}
 		} else {
-			mh = append(mh, c.pa.hdb...)
+			if c.pa.hdr <= 0 {
+				mh = append(mh, '0')
+			} else {
+				mh = append(mh, c.pa.hdb...)
+			}
+			mh = append(mh, ' ')
+			mh = append(mh, c.pa.szb...)
 		}
-		mh = append(mh, ' ')
-		mh = append(mh, c.pa.szb...)
 	} else if hasHeader {
 		if canReceiveHeader {
 			mh[0] = 'H'
-			mh = append(mh, c.pa.hdb...)
-			mh = append(mh, ' ')
-			mh = append(mh, c.pa.szb...)
-		} else {
+			if inject {
+				if origHasHeader {
+					delta := len(itags)
+					mh = appendHeaderAndSize(mh, c.pa.hdr+delta, c.pa.size+delta)
+				} else {
+					hsz := len(ihdr)
+					mh = appendHeaderAndSize(mh, hsz, c.pa.size+hsz)
+				}
+			} else {
+				mh = append(mh, c.pa.hdb...)
+				mh = append(mh, ' ')
+				mh = append(mh, c.pa.szb...)
+			}
+		} else if origHasHeader {
 			// If we are here we need to truncate the payload size
 			nsz := strconv.Itoa(c.pa.size - c.pa.hdr)
 			mh = append(mh, nsz...)
+		} else {
+			mh = append(mh, c.pa.szb...)
 		}
 	} else {
 		mh = append(mh, c.pa.szb...)
@@ -3541,7 +3587,10 @@ func (c *client) msgHeaderForRouteOrLeaf(subj, reply []byte, rt *routeTarget, ac
 func (c *client) msgHeader(subj, reply []byte, sub *subscription) []byte {
 	// See if we should do headers. We have to have a headers msg and
 	// the client we are going to deliver to needs to support headers as well.
-	hasHeader := c.pa.hdr > 0
+	ihdr, itags := c.jwtTagHeadersForInject()
+	inject := len(itags) > 0
+	origHasHeader := c.pa.hdr > 0
+	hasHeader := origHasHeader || inject
 	canReceiveHeader := sub.client != nil && sub.client.headers
 
 	var mh []byte
@@ -3564,13 +3613,25 @@ func (c *client) msgHeader(subj, reply []byte, sub *subscription) []byte {
 	}
 	if hasHeader {
 		if canReceiveHeader {
-			mh = append(mh, c.pa.hdb...)
-			mh = append(mh, ' ')
-			mh = append(mh, c.pa.szb...)
-		} else {
+			if inject {
+				if origHasHeader {
+					delta := len(itags)
+					mh = appendHeaderAndSize(mh, c.pa.hdr+delta, c.pa.size+delta)
+				} else {
+					hsz := len(ihdr)
+					mh = appendHeaderAndSize(mh, hsz, c.pa.size+hsz)
+				}
+			} else {
+				mh = append(mh, c.pa.hdb...)
+				mh = append(mh, ' ')
+				mh = append(mh, c.pa.szb...)
+			}
+		} else if origHasHeader {
 			// If we are here we need to truncate the payload size
 			nsz := strconv.Itoa(c.pa.size - c.pa.hdr)
 			mh = append(mh, nsz...)
+		} else {
+			mh = append(mh, c.pa.szb...)
 		}
 	} else {
 		mh = append(mh, c.pa.szb...)
@@ -3755,9 +3816,17 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 	// support we need to strip the headers from the payload.
 	// The actual header would have been processed correctly for us, so just
 	// need to update payload.
+	ihdr, itags := c.jwtTagHeadersForInject()
+	inject := len(itags) > 0 && sub.client.headers
 	hdrSize := c.pa.hdr
 	if c.pa.hdr > 0 && !sub.client.headers {
 		msg = msg[c.pa.hdr:]
+	} else if inject {
+		if c.pa.hdr > 0 {
+			hdrSize = c.pa.hdr + len(itags)
+		} else {
+			hdrSize = len(ihdr)
+		}
 	}
 
 	// Update statistics
@@ -3767,6 +3836,13 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 	// MQTT producers send messages without CR_LF, so don't remove it for them.
 	if !prodIsMQTT {
 		msgSize -= int64(LEN_CR_LF)
+	}
+	if inject {
+		if c.pa.hdr > 0 {
+			msgSize += int64(len(itags))
+		} else {
+			msgSize += int64(len(ihdr))
+		}
 	}
 
 	// We do not update the outbound stats if we are doing trace only since
@@ -3865,7 +3941,23 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 
 	// Queue to outbound buffer
 	client.queueOutbound(mh)
-	client.queueOutbound(msg)
+	if inject {
+		if c.pa.hdr > 0 {
+			insertAt := c.pa.hdr - LEN_CR_LF
+			if insertAt > 0 && insertAt <= len(msg) {
+				client.queueOutbound(msg[:insertAt])
+				client.queueOutbound(itags)
+				client.queueOutbound(msg[insertAt:])
+			} else {
+				client.queueOutbound(msg)
+			}
+		} else {
+			client.queueOutbound(ihdr)
+			client.queueOutbound(msg)
+		}
+	} else {
+		client.queueOutbound(msg)
+	}
 	if prodIsMQTT {
 		// Need to add CR_LF since MQTT producers don't send CR_LF
 		client.queueOutbound([]byte(CR_LF))
@@ -6567,6 +6659,68 @@ func (c *client) getAuthUserLabel() string {
 	default:
 		return ""
 	}
+}
+
+func buildJWTTagHeader(tags jwt.TagList) []byte {
+	if len(tags) == 0 {
+		return nil
+	}
+	// Header layout:
+	// NATS/1.0\r\n
+	// K:V\r\n
+	// ...
+	// \r\n
+	ihdr := make([]byte, 0, len(hdrLine)+len(tags)*16+LEN_CR_LF)
+	ihdr = append(ihdr, hdrLine...)
+	valid := false
+	for _, tag := range tags {
+		key, value, ok := strings.Cut(tag, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == _EMPTY_ {
+			continue
+		}
+		// Prevent CRLF/header injection.
+		if strings.ContainsAny(key, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			continue
+		}
+		if !isValidHeaderName(key) {
+			continue
+		}
+		ihdr = append(ihdr, key...)
+		ihdr = append(ihdr, ':')
+		ihdr = append(ihdr, value...)
+		ihdr = append(ihdr, _CRLF_...)
+		valid = true
+	}
+	if !valid {
+		return nil
+	}
+	ihdr = append(ihdr, _CRLF_...)
+	return ihdr
+}
+
+func isValidHeaderName(name string) bool {
+	if name == _EMPTY_ {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c <= 32 || c >= 127 {
+			return false
+		}
+		switch c {
+		case '(', ')', '<', '>', '@',
+			',', ';', ':', '\\', '"',
+			'/', '[', ']', '?', '=',
+			'{', '}':
+			return false
+		}
+	}
+	return true
 }
 
 // Given an array of strings, this function converts it to a map as long

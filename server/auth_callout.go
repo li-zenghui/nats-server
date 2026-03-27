@@ -307,9 +307,12 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		ihdr := buildJWTTagHeader(arc.Tags)
+
 		// See if the response wants to override the username.
 		if arc.Name != _EMPTY_ {
 			c.mu.Lock()
+			c.ihdr = ihdr
 			c.opts.Username = arc.Name
 			// Clear any others.
 			c.opts.Nkey = _EMPTY_
